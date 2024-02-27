@@ -1,0 +1,445 @@
+## libraries
+```{r, include=FALSE}
+library(tidyverse)
+library(corrr)
+library(ggcorrplot)
+library(factoextra)
+library(mclust)
+library(cluster)
+```
+
+## read in data
+```{r}
+nfl <- read.csv("nfl_data.csv")
+cfb <- read.csv("cfb_data.csv")
+
+# no NAs in either dataset
+any(is.na(cfb))
+any(is.na(nfl))
+```
+
+# data viz
+```{r}
+cfb %>% 
+  filter(!ThrowType %in% c("Hail Mary", "Flea Flicker", "Normal",
+                           "Touch", "Sidearm", "NULL")) %>% 
+  group_by(Season, OffTeamName) %>% 
+  summarise(level_1 = sum(ThrowType == "Level 1"),
+            level_2 = sum(ThrowType == "Level 2"),
+            level_3 = sum(ThrowType == "Level 3"),
+            shovel = sum(ThrowType == "Shovel"),
+            n_throw_types_obs = n()) %>% 
+  ggplot(aes(x = level_1)) + 
+  geom_histogram()
+
+cfb %>% 
+  filter(!GeneralTargetType %in% c("NULL", "Other")) %>% 
+  group_by(Season, OffTeamName) %>% 
+  summarise(screen = sum(GeneralTargetType == "Screen"),
+            out = sum(GeneralTargetType == "Out"),
+            corner = sum(GeneralTargetType == "Corner"),
+            cross = sum(GeneralTargetType == "Cross"),
+            flat = sum(GeneralTargetType == "Flat"),
+            hook = sum(GeneralTargetType == "Hook"),
+            vertical = sum(GeneralTargetType == "Vertical"),
+            post = sum(GeneralTargetType == "Post"),
+            shallow = sum(GeneralTargetType == "Shallow"),
+            comeback = sum(GeneralTargetType == "Comeback")) %>% 
+  ggplot(aes(x = shallow)) + 
+  geom_histogram()
+
+runtypes <- unique(cfb$RunType)
+
+map(runtypes, function(x) cfb %>% 
+      group_by(Season, OffTeamName) %>% 
+      filter(RunType == x, .preserve = T) %>% 
+      summarise(RunType = n()) %>% 
+      ggplot(aes(x = RunType)) + 
+      geom_histogram() +
+      labs(title = x))
+
+# use qb draw, qb design, scramble - open run lane
+
+#df4 (cut)
+# short pass pct
+# determine "short routes"
+cfb %>% 
+  filter(!GeneralTargetType == "NULL") %>% 
+  mutate(ThrowDepth = as.numeric(ThrowDepth)) %>% 
+  drop_na() %>% 
+  ggplot(aes(ThrowDepth)) +
+  geom_histogram() +
+  facet_wrap(~GeneralTargetType)
+
+cfb %>% 
+  mutate(
+    short_pass = case_when(
+    ThrowDepth == "NULL" ~ NA,
+    ThrowDepth < 10 ~ 1,
+    .default = 0
+  )) %>% 
+  drop_na() %>% 
+  group_by(Season, OffTeamName) %>% 
+  summarise(short_pass_pct = sum(short_pass) / n(),
+            n_short_pass_obs = n()) -> df4
+
+```
+
+## aggregate cfb data
+```{r, include=FALSE}
+# every sack is considered a carry w/ run type NULL
+cfb %>% 
+  filter(PassingAttempt == "0" & Carries == "1") %>% 
+  select(RunType) %>% 
+  distinct()
+
+# passing attempt: 0 = sack; NULL = QB run
+# consider keeping pocket pass?; need rush pct
+
+# motion pct
+cfb %>% 
+  mutate(AnyMotion = as.numeric(AnyMotion),
+         JetMotion = as.numeric(JetMotion),
+         motion = case_when(AnyMotion == 1 |
+                              JetMotion == 1 ~ 1,
+                            is.na(AnyMotion) == T |
+                              is.na(JetMotion) == T ~ NA,
+                            .default = 0)) %>% 
+  drop_na() %>% 
+  group_by(Season, OffTeamName) %>% 
+  summarise(motion_pct = sum(motion) / n(),
+            n_motion_obs = n()) %>% 
+  ungroup() -> df1
+
+# play action pct
+cfb %>% 
+  mutate(PlayAction = as.numeric(PlayAction)) %>% 
+  drop_na() %>% 
+  group_by(Season, OffTeamName) %>% 
+  summarise(play_action_pct = sum(PlayAction / n()),
+            n_playaction_obs = n()) -> df2
+
+# pass misdirection pct
+cfb %>% 
+  group_by(Season, OffTeamName) %>% 
+  summarise(rpo_pct = sum(RPO) / n(),
+            n_rpo_obs = n()) -> df3
+
+# throw types pct
+cfb %>% 
+  filter(!ThrowType %in% c("Hail Mary", "Flea Flicker", "Normal",
+                           "Touch", "Sidearm", "Shovel", "NULL")) %>% 
+  group_by(Season, OffTeamName) %>% 
+  summarise(long_throw_pct = sum(ThrowType %in% c("Level 2", 
+                                               "Level 3")) / n(),
+            short_pass_pct = sum(ThrowType == "Level 1")/ n(),
+            n_long_throw_obs = n()) -> df5
+
+# pass protection blocking scheme pct
+cfb %>% 
+  filter(!BlockingScheme %in% c("NULL", "No Video")) %>% 
+  group_by(Season, OffTeamName) %>% 
+  summarise(pass_prot_pct = 
+              sum(BlockingScheme == "Pass Protection") / n(),
+            n_blocking_obs = n()) -> df6
+
+# merge data
+dfs <- list(df1, df2, df3, 
+            #df4,
+            df5, df6)
+
+merge_columns <- c("Season", "OffTeamName")
+
+Reduce(function(x, y) merge(x, y, by = merge_columns), 
+       dfs) %>% 
+  rename("Team" = "OffTeamName") %>% 
+  rowwise() %>%
+  mutate(row_name = paste(Season, Team, sep = " ")) %>%
+  ungroup() %>%
+  column_to_rownames(var = "row_name") -> cluster_data
+```
+
+## aggregate nfl data
+```{r, include=FALSE}
+# every sack is considered a carry w/ run type NULL
+nfl %>% 
+  filter(PassingAttempt == "0" & Carries == "1") %>% 
+  select(RunType) %>% 
+  distinct()
+
+# passing attempt: 0 = sack; NULL = QB run
+# consider keeping pocket pass?; need rush pct
+
+# motion pct
+nfl %>% 
+  mutate(AnyMotion = as.numeric(AnyMotion),
+         JetMotion = as.numeric(JetMotion),
+         motion = case_when(AnyMotion == 1 |
+                              JetMotion == 1 ~ 1,
+                            is.na(AnyMotion) == T |
+                              is.na(JetMotion) == T ~ NA,
+                            .default = 0)) %>% 
+  drop_na() %>% 
+  group_by(Season, OffTeamName) %>% 
+  summarise(motion_pct = sum(motion) / n(),
+            n_motion_obs = n()) %>% 
+  ungroup() -> df1
+
+# play action pct
+nfl %>% 
+  mutate(PlayAction = as.numeric(PlayAction)) %>% 
+  drop_na() %>% 
+  group_by(Season, OffTeamName) %>% 
+  summarise(play_action_pct = sum(PlayAction / n()),
+            n_playaction_obs = n()) -> df2
+
+# rpo pct
+nfl %>% 
+  group_by(Season, OffTeamName) %>% 
+  summarise(rpo_pct = sum(RPO) / n(),
+            n_rpo_obs = n()) -> df3
+
+# short pass pct
+nfl %>% 
+  mutate(short_pass = case_when(
+    ThrowDepth == "NULL" ~ NA,
+    ThrowDepth < 10 ~ 1,
+    .default = 0
+  )) %>% 
+  drop_na() %>% 
+  group_by(Season, OffTeamName) %>% 
+  summarise(short_pass_pct = sum(short_pass) / n(),
+            screen_pct = sum(GeneralTargetType == "Screen") / n(),
+            n_short_pass_obs = n()) -> df4
+
+# long throw pct
+nfl %>% 
+  filter(!ThrowType %in% c("Hail Mary", "Flea Flicker", "Normal",
+                           "Touch", "Sidearm", "Shovel", "NULL")) %>% 
+  group_by(Season, OffTeamName) %>% 
+  summarise(long_throw_pct = sum(ThrowType %in% c("Level 2", 
+                                               "Level 3")) / n(),
+            n_long_throw_obs = n()) -> df5
+
+# pass protection pct
+nfl %>% 
+  filter(!BlockingScheme %in% c("NULL", "No Video")) %>% 
+  group_by(Season, OffTeamName) %>% 
+  summarise(pass_prot_pct = 
+              sum(BlockingScheme == "Pass Protection") / n(),
+            n_blocking_obs = n()) -> df6
+
+# pocket pct
+nfl %>% 
+  group_by(Season, OffTeamName) %>% 
+  summarise(pocket_pct = sum(InPocket == "1") / n(),
+            n_pocket_obs = n()) -> df7
+
+# merge data
+dfs <- list(df1, df2, df3, 
+            df4, df5, df6,
+            df7)
+
+merge_columns <- c("Season", "OffTeamName")
+
+Reduce(function(x, y) merge(x, y, by = merge_columns), 
+       dfs) %>% 
+  rename("Team" = "OffTeamName") %>% 
+  rowwise() %>%
+  mutate(row_name = paste(Season, Team, sep = " ")) %>%
+  ungroup() %>%
+  column_to_rownames(var = "row_name") -> cluster_data
+```
+
+# model data viz
+```{r}
+model_data %>% ggplot(aes(motion_pct)) + geom_histogram()
+model_data %>% ggplot(aes(play_action_pct)) + geom_histogram()
+model_data %>% ggplot(aes(rpo_pct)) + geom_histogram()
+model_data %>% ggplot(aes(short_pass_pct)) + geom_histogram()
+model_data %>% ggplot(aes(long_throw_pct)) + geom_histogram()
+model_data %>% ggplot(aes(pass_prot_pct)) + geom_histogram()
+```
+
+
+# PCA and cluster analysis
+```{r}
+# predictors
+predictors <- names(cluster_data %>% 
+                      select(!contains("_obs"), -Season, -Team))
+
+min_sample <- 50
+obs_cols <- names(cluster_data)[grep("_obs", names(cluster_data))]
+cluster_data %>% 
+  #bind_rows(nfl_data) %>% 
+  filter(n_motion_obs >= 50,
+         n_playaction_obs >= 50,
+         n_long_throw_obs >= 50,
+         n_blocking_obs >= 50) %>% 
+  select(all_of(predictors)) -> model_data
+
+# correlation plot
+model_data %>% 
+  rename("Motion%" = "motion_pct",
+         "Play Action%" = "play_action_pct",
+         "RPO%" = "rpo_pct",
+         "Long Throw%" = "long_throw_pct",
+         "Short Pass%" = "short_pass_pct",
+         "Pass Protection%" = "pass_prot_pct") %>% 
+  scale() %>% 
+  cor() %>% 
+  ggcorrplot(title = "Predictors Correlation") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        text = element_text(family = "serif")) -> corr_plot
+
+ggsave("corr_plot.jpeg", corr_plot, device = "jpeg")
+
+# PCA
+model_data %>% 
+  prcomp(center = T, scale. = T) %>% 
+  .[["x"]] -> pca_data
+
+# Scaled data
+model_data %>% 
+  scale() -> scaled_data
+
+# Percentile data
+model_data %>% 
+  mutate(across(.cols = all_of(predictors),
+                ~ntile(., 100))) -> percentile_data
+```
+
+# cluster optimization viz
+```{r}
+# optimal clusters (default Euclidean method for diss arg) w/ kmeans
+fviz_nbclust(x = scaled_data,
+             FUNcluster = stats::kmeans, 
+             method = "gap_stat", # silhouette or gap_stat
+             k.max = 10, 
+             verbose = T) +
+  theme_bw(base_family = "serif") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) +
+  labs(title = "Optimal Number of Clusters") -> optimal_clusters
+
+ggsave("optimal_clusters.png", optimal_clusters, device = "png")
+
+# optimal clusters (default Euclidean method for diss arg) w/ hcut
+fviz_nbclust(x = percentile_data,
+             FUNcluster = hcut, 
+             method = "silhouette", # silhouette or gap_stat
+             k.max = 10, 
+             verbose = T)
+
+# optimal clusters (default Euclidean method for diss arg) w/ pam clusters
+fviz_nbclust(x = percentile_data,
+             FUNcluster = cluster::pam, 
+             method = "silhouette", # silhouette or gap_stat
+             k.max = 10, 
+             verbose = T)
+```
+
+# cluster tests
+```{r}
+G <- 3
+k <- 3
+
+kmeans <- kmeans(scaled_data, G)
+gmm <- Mclust(scaled_data, G)
+pam <- cluster::pam(scaled_data, k = k)
+
+gmm_clusters <- data.frame(percentile_data, 
+                           cluster = gmm[["classification"]], 
+                           uncertainty = gmm[["uncertainty"]])
+
+kmeans_clusters <- data.frame(scaled_data,
+                              cluster = kmeans[["cluster"]])
+
+pam_clusters <- data.frame(percentile_data,
+                           cluster = pam[["clustering"]])
+```
+
+# visualize relationships
+```{r}
+fviz_silhouette(pam)
+fviz_silhouette(silhouette(kmeans[["cluster"]], dist(scaled_data))) +
+  theme_bw(base_family = "serif") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.text.x = element_blank()) -> sil_score
+ggsave("sil_score.png", sil_score, device = "png")
+
+fviz_silhouette(silhouette(gmm[["classification"]], dist(scaled_data)))
+```
+
+# Cronbach's alpha
+```{r}
+# Chronback alpha function (courtesy of: https://blogs.fangraphs.com/a-new-way-to-look-at-sample-size/)
+cb_alpha <- function(df, K=ncol(df)){
+  
+  wide.vector <- c()
+  tall.vector <- c()
+  
+  for (j in 1:ncol(df[,1:K])){
+    
+    tall.vector <- c(tall.vector, var(df[,j]))
+    
+  }
+  for (i in 1:nrow(df[,1:K])){
+    
+    wide.vector <- c(wide.vector, sum(data.matrix(df[,1:K])[i,]))
+    
+  }
+  
+  alpha <- K/(K-1)*(1-sum(tall.vector)/var(wide.vector))
+  X_bar <- mean(wide.vector)
+  sd <- sqrt(var(wide.vector))
+  return(list(alpha = alpha, 
+              X_bar = X_bar, 
+              K = K, 
+              sd = sd, 
+              within=tall.vector, 
+              between=wide.vector))
+  
+}
+
+min_samp_size <- cluster_data %>% 
+  arrange(n_motion_obs) %>% 
+  select(n_motion_obs) %>% 
+  unlist()
+
+sample.list <- seq(from = min_samp_size %>% min(), 
+                   to = min_samp_size %>% 
+                     quantile(probs = seq(0.1, 1, 0.1)) %>% 
+                     .[[1]] %>% 
+                     ceiling(), 
+                   by = 1)
+
+# predictor parse functions
+motion_parse <- function(df,K,random=T){
+  
+  if (random) {
+    return(stat_random(df,K)$motion_pct[1:K])
+  }
+  else return(df$motion_pct[1:K])
+}
+
+# combine all parse functions
+FUN.list <- list(list(motion_parse, 'motion_pct'))
+
+for (i in sample.list){
+  
+  for (j in FUN.list) {
+    
+    player.year.matrix <- matrix_parse(df.prep,i,j[[1]], Random) 
+    #get rid of the matrix_parse i
+    alpha.list <- FG_alpha(player.year.matrix)
+    out.list <- data.frame(denom=i, type = 'Snap', stat=j[[2]],
+                           alpha=alpha.list$alpha, 
+                           sample_mean = alpha.list$X_bar, 
+                           sample_sd = alpha.list$sd)
+    out.df <- rbind(out.df, out.list)
+  }
+}
+cb_alpha(cluster_data %>% 
+           filter(n_motion_obs > min_samp_size[1]) %>% 
+           select(!contains("_obs"), -Season, -Team))
+```
